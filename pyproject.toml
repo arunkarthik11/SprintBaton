@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sprintbaton"
+version = "0.2.3"
+description = "An asynchronous coding agent that runs on your todolist."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+dependencies = [
+    # No provider SDK is a base dependency (pluggable-hosted-backends spec
+    # §4.8): `anthropic` and `claude-agent-sdk` are extras below, on the same
+    # footing as the OpenAI/Google/OpenHands ones, and every module imports
+    # them lazily. A subprocess-CLI-only setup (claude_code_cli, codex_cli,
+    # gemini_cli) needs no provider extra at all.
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.0.0",
+    "httpx>=0.27.0",
+    "typer>=0.12.0",
+    "cryptography>=42.0.0",
+    "PyYAML>=6.0",
+    "opentelemetry-sdk>=1.20.0",
+    "python-json-logger>=2.0.0",
+    # Every storage/service client is an extra below (pluggable-hosted-
+    # backends spec §5), and every module imports its client lazily, so the
+    # tool-mode base install (SQLite, filesystem blobs, in-process queue,
+    # flock) needs none of them.
+]
+
+[project.optional-dependencies]
+# --- storage and service extras (spec §5) ---
+mongo = ["pymongo>=4.0.0", "opentelemetry-instrumentation-pymongo>=0.41b0"]
+postgres = ["psycopg[binary]>=3.1", "psycopg-pool>=3.2"]
+s3 = ["boto3>=1.34.0"]
+gcs = ["google-cloud-storage>=2.10.0"]
+azure = ["azure-storage-blob>=12.19.0", "azure-identity>=1.15.0"]
+redis = ["redis>=5.0.0"]
+api = ["fastapi>=0.110.0", "uvicorn>=0.29.0", "bcrypt>=4.0.0"]
+otlp = ["opentelemetry-exporter-otlp-proto-grpc>=1.20.0"]
+# Convenience group: every storage client plus the API and the OTLP exporter —
+# and no provider SDK. The default hosted image's STORAGE_EXTRAS is the same set.
+hosted = ["sprintbaton[mongo,postgres,s3,gcs,azure,redis,api,otlp]"]
+# The test suite exercises every storage client, the API, and both Anthropic
+# harnesses, so the dev extra pulls all of them in.
+dev = [
+    "sprintbaton[hosted,anthropic,claude-agent-sdk]",
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+]
+
+# Per-provider optional dependencies (provider-registration spec §7,
+# pluggable-hosted-backends spec §5). The base install carries no provider SDK;
+# each harness that needs an in-process SDK declares its extra here, and
+# `sprintbaton providers add <name>` installs `sprintbaton[<extra>]` on demand
+# (tool mode) or reports it missing (hosted mode — the operator bakes it into
+# the image through the PROVIDER_EXTRAS build argument). The pure subprocess
+# wrappers (claude_code_cli, codex_cli, gemini_cli) need no extra.
+anthropic = ["anthropic>=0.60.0"]                 # single_shot, raw_tool_loop
+# Wheel-only in practice: the wheel bundles the `claude` executable and the
+# sdist does not (see Dockerfile).
+claude-agent-sdk = ["claude-agent-sdk>=0.2.0"]    # claude_agent_sdk
+openhands = ["openhands-ai>=0.1.0"]
+
+# Multi-provider parity (multi-provider-parity spec §6): one extra per new
+# per-harness dependency, independently installable so a deployment can opt
+# into cheap single-shot classification parity without pulling in a full agent
+# framework. `sprintbaton providers add <name> --harness ...` installs the
+# selected ones on demand (tool mode) or reports them missing (hosted mode).
+openai = ["openai>=1.0.0"]                # openai_single_shot
+openai-agents = ["openai-agents>=0.1.0"]  # openai_agent_sdk (pulls in `openai`)
+google-genai = ["google-genai>=1.0.0"]    # gemini_single_shot
+google-adk = ["google-adk>=1.0.0"]        # gemini_agent_sdk
+
+[project.scripts]
+sprintbaton = "sprintbaton.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sprintbaton*"]
+
+[tool.setuptools.package-data]
+"sprintbaton.prompts" = ["templates/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

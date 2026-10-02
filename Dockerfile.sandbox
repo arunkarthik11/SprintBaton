@@ -1,0 +1,88 @@
+# The sandbox service image (docs/hosted-sandbox-isolation-spec.md §10.1).
+#
+# Carries NO orchestrator, resolver or credential code: only sprintbaton/sandbox/
+# base.py and server/ are copied in (tests/sandbox/test_source_scans.py asserts
+# the server imports nothing else). No deployment secret ever lives here — the
+# one secret is the worker<->sandbox token, mounted as a file OUTSIDE every
+# read-only bind a run sees (/var/run/secrets is not bound; health() refuses a
+# token file under one).
+#
+# Build the worker (Dockerfile) and this image from ONE definition
+# (docker-bake.hcl) with the SAME PROVIDER_EXTRAS and CLAUDE_AGENT_SDK_VERSION:
+# the `claude` binary here must be the one bundled in the worker's SDK wheel,
+# and SandboxTransport fails a run loudly on a mismatch (spec §7.2).
+#
+# The binary is conditional (pluggable-hosted-backends spec §6): it exists only
+# to run claude_agent_sdk agents, so a build whose PROVIDER_EXTRAS omits
+# claude-agent-sdk leaves stage 1's /out empty and the ~262 MB binary out of
+# the image.
+
+ARG PROVIDER_EXTRAS="anthropic,claude-agent-sdk"
+ARG CLAUDE_AGENT_SDK_VERSION=""
+
+# --- stage 1: the claude binary, straight out of the SDK wheel ----------------
+FROM python:3.12-slim-bookworm AS claude
+ARG PROVIDER_EXTRAS
+ARG CLAUDE_AGENT_SDK_VERSION
+RUN set -eu; mkdir -p /out; \
+    case ",$(echo "${PROVIDER_EXTRAS}" | tr -d ' ')," in \
+      *,claude-agent-sdk,*) \
+        pip install --no-cache-dir --only-binary claude-agent-sdk \
+            "claude-agent-sdk${CLAUDE_AGENT_SDK_VERSION:+==${CLAUDE_AGENT_SDK_VERSION}}"; \
+        python -c "import pathlib, shutil, claude_agent_sdk as s; p = pathlib.Path(s.__file__).parent / '_bundled' / 'claude'; shutil.copy(p, '/out/claude')"; \
+        /out/claude --version ;; \
+      *) echo "claude-agent-sdk not in PROVIDER_EXTRAS: building without the claude binary" ;; \
+    esac
+
+# --- stage 2: the seccomp profile, compiled on this image's architecture ------
+FROM debian:bookworm-slim AS seccomp
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-seccomp \
+ && rm -rf /var/lib/apt/lists/*
+COPY sprintbaton/sandbox/server/seccomp.py /seccomp.py
+RUN mkdir -p /out && python3 /seccomp.py --out /out/seccomp.bpf
+
+# --- stage 3: the sandbox ------------------------------------------------------
+# Pinned to bookworm: `playwright install --with-deps` supports it, and the
+# unpinned python:3.12-slim tag now follows Debian trixie.
+FROM python:3.12-slim-bookworm
+
+# bubblewrap is the boundary (§10.2); git serves the sandbox-side .git copy;
+# the rest is the generous v1 toolchain set (§10.1). Per-project images are
+# future work (§13.4).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bubblewrap git ca-certificates curl procps \
+        build-essential pkg-config \
+        nodejs npm \
+        golang-go \
+        default-jdk-headless maven \
+ && rm -rf /var/lib/apt/lists/*
+
+# Headless Chromium for Playwright at a fixed path the run environment names
+# (PLAYWRIGHT_BROWSERS_PATH=/ms-playwright). Chromium runs with --no-sandbox:
+# its own sandbox needs user namespaces that do not nest inside bubblewrap,
+# and bubblewrap is the boundary.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN pip install --no-cache-dir playwright \
+ && playwright install --with-deps chromium \
+ && chmod -R a+rX /ms-playwright
+
+COPY --from=claude /out/ /usr/local/bin/
+COPY --from=seccomp /out/seccomp.bpf /etc/sprintbaton/seccomp.bpf
+
+WORKDIR /opt/sprintbaton
+COPY sprintbaton/__init__.py sprintbaton/__init__.py
+COPY sprintbaton/sandbox/__init__.py sprintbaton/sandbox/base.py sprintbaton/sandbox/
+COPY sprintbaton/sandbox/server/ sprintbaton/sandbox/server/
+ENV PYTHONPATH=/opt/sprintbaton
+
+RUN useradd --uid 1000 --create-home sandbox \
+ && mkdir -p /var/lib/sprintbaton-sandbox && chown sandbox /var/lib/sprintbaton-sandbox
+USER sandbox
+
+ENV SPRINTBATON_SANDBOX_ROOT=/var/lib/sprintbaton-sandbox \
+    SPRINTBATON_SANDBOX_SECCOMP=/etc/sprintbaton/seccomp.bpf \
+    SPRINTBATON_SANDBOX_TOKEN_FILE=/var/run/secrets/sprintbaton/token \
+    SPRINTBATON_SANDBOX_PORT=8090
+
+EXPOSE 8090
+CMD ["python", "-m", "sprintbaton.sandbox.server"]
